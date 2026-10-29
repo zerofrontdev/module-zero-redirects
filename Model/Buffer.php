@@ -36,13 +36,17 @@ class Buffer
         if (is_file($file) && filesize($file) > self::MAX_BYTES) {
             return;
         }
-        $dir = dirname($file);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0775, true);
-        }
         $line = json_encode([$storeId, $path, $referer, time()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
-        // One short write with O_APPEND: lines from parallel requests don't interleave.
-        @file_put_contents($file, $line, FILE_APPEND | LOCK_EX);
+        try {
+            $dir = dirname($file);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0775, true);
+            }
+            // One short write with O_APPEND: lines from parallel requests don't interleave.
+            file_put_contents($file, $line, FILE_APPEND | LOCK_EX);
+        } catch (\Throwable) {
+            // A full disk or a directory made by a parallel request a moment ago: a 404 not noted, no error on the page.
+        }
     }
 
     /**
@@ -57,10 +61,12 @@ class Buffer
             return;
         }
         $taken = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4));
-        if (!@rename($file, $taken)) {
+        try {
+            // Another cron run may have taken the file a moment ago: then there is nothing to read.
+            $handle = rename($file, $taken) ? fopen($taken, 'rb') : false;
+        } catch (\Throwable) {
             return;
         }
-        $handle = @fopen($taken, 'rb');
         if ($handle) {
             while (($line = fgets($handle)) !== false) {
                 $row = json_decode($line, true);
@@ -69,8 +75,12 @@ class Buffer
                 }
             }
             fclose($handle);
+            try {
+                unlink($taken);
+            } catch (\Throwable) {
+                // Left behind: read once more by the next run, which is harmless for a 404 count.
+            }
         }
-        @unlink($taken);
     }
 
     private function file(): string
