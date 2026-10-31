@@ -33,7 +33,9 @@ A 404 never touches the database: it appends one line to
 `var/zero_redirects/404.log` (about 20 µs). Cron, every 5 minutes, folds
 the file into the log table (one row per store view and path, written in
 batches) and works out the suggestions; opening the 404 Log page does the
-same first, so the list is current without cron. Limits, so a flood of
+same first, so the list is current without cron. A file a crashed run
+took but never finished (`404.log.<pid>.<random>`, untouched for 10
+minutes) is read by the next run first. Limits, so a flood of
 404s (a scanner, a broken link on a busy page) can't grow without end: the
 file stops taking lines at 20 MB until cron empties it, and the log keeps
 at most 20,000 open addresses (the least asked for and longest unseen
@@ -70,6 +72,8 @@ they are URL rewrites.
 `dev/tests/zero-e2e/tests/redirects-admin.spec.ts` (project
 `redirects-admin`): a logged 404 with its hits and referrer, the suggested
 target, Redirect answering 301 at once, Ignore.
+
+What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

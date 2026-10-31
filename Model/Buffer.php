@@ -17,12 +17,16 @@ use Magento\Framework\Filesystem;
  * waiting for cron, new 404s are dropped: a flood of random addresses fills
  * neither the disk nor, later, the table. take() hands the lines over and
  * starts a new file (a rename, so a request appending meanwhile isn't lost).
+ * A taken file a crashed run left behind (404.log.<pid>.<random>, untouched
+ * for LEFTOVER_SECONDS) is read by the next take() first.
  */
 class Buffer
 {
     public const MAX_BYTES = 20 * 1024 * 1024;
     private const DIR = 'zero_redirects';
     private const FILE = '404.log';
+    /** A taken file older than this belongs to a run that died: no run reads one for so long. */
+    private const LEFTOVER_SECONDS = 600;
 
     public function __construct(
         private readonly Filesystem $filesystem
@@ -50,36 +54,78 @@ class Buffer
     }
 
     /**
-     * The buffered 404s, removed from the buffer.
+     * The buffered 404s, removed from the buffer: first what a crashed run left, then the current file.
      *
      * @return \Generator<array{0: int, 1: string, 2: string|null, 3: int}>
      */
     public function take(): \Generator
     {
         $file = $this->file();
+        foreach (glob($file . '.*') ?: [] as $leftover) {
+            clearstatcache(true, $leftover);
+            $mtime = is_file($leftover) ? filemtime($leftover) : false;
+            if ($mtime === false || $mtime >= time() - self::LEFTOVER_SECONDS) {
+                continue; // being read by a run right now (its take() touched it)
+            }
+            $claimed = $this->claim($leftover);
+            if ($claimed !== null) {
+                yield from $this->read($claimed);
+            }
+        }
         if (!is_file($file)) {
             return;
         }
-        $taken = $file . '.' . getmypid() . '.' . bin2hex(random_bytes(4));
+        $taken = $this->claim($file);
+        if ($taken !== null) {
+            yield from $this->read($taken);
+        }
+    }
+
+    /**
+     * The file renamed to a name of this run's, its time set to now (a leftover is told by its age): null when
+     * another run took it a moment ago.
+     */
+    private function claim(string $path): ?string
+    {
+        $taken = $this->file() . '.' . getmypid() . '.' . bin2hex(random_bytes(4));
         try {
-            // Another cron run may have taken the file a moment ago: then there is nothing to read.
-            $handle = rename($file, $taken) ? fopen($taken, 'rb') : false;
+            if (!rename($path, $taken)) {
+                return null;
+            }
+            touch($taken);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $taken;
+    }
+
+    /**
+     * The lines of a taken file, then the file removed.
+     *
+     * @return \Generator<array{0: int, 1: string, 2: string|null, 3: int}>
+     */
+    private function read(string $taken): \Generator
+    {
+        try {
+            $handle = fopen($taken, 'rb');
         } catch (\Throwable) {
             return;
         }
-        if ($handle) {
-            while (($line = fgets($handle)) !== false) {
-                $row = json_decode($line, true);
-                if (is_array($row) && count($row) === 4) {
-                    yield [(int) $row[0], (string) $row[1], $row[2] !== null ? (string) $row[2] : null, (int) $row[3]];
-                }
+        if (!$handle) {
+            return;
+        }
+        while (($line = fgets($handle)) !== false) {
+            $row = json_decode($line, true);
+            if (is_array($row) && count($row) === 4) {
+                yield [(int) $row[0], (string) $row[1], $row[2] !== null ? (string) $row[2] : null, (int) $row[3]];
             }
-            fclose($handle);
-            try {
-                unlink($taken);
-            } catch (\Throwable) {
-                // Left behind: read once more by the next run, which is harmless for a 404 count.
-            }
+        }
+        fclose($handle);
+        try {
+            unlink($taken);
+        } catch (\Throwable) {
+            // Left behind: read once more by a later run (after LEFTOVER_SECONDS), harmless for a 404 count.
         }
     }
 
